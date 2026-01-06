@@ -1,0 +1,226 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+from typing import Optional, Dict
+
+
+# ====================================
+# DATA LOADING
+# ====================================
+def load_price_data(ticker: str, start: str, end: str) -> pd.Series:
+    df = yf.download(ticker, start=start, end=end, progress=False)
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    if "Adj Close" in df.columns:
+        prices = df["Adj Close"]
+    elif "Close" in df.columns:
+        prices = df["Close"]
+    else:
+        raise KeyError("No usable price column found.")
+
+    prices = prices.dropna()
+
+    if len(prices) < 2:
+        raise ValueError("Insufficient price history.")
+
+    return prices
+
+
+# ====================================
+# RETURN ESTIMATION
+# ====================================
+def estimate_return_params(prices: pd.Series) -> Dict[str, float]:
+    log_returns = np.log(prices).diff().dropna()
+    mu = log_returns.mean()
+    sigma = log_returns.std(ddof=1)
+
+    if sigma == 0:
+        raise ValueError("Zero volatility detected.")
+
+    return {"mu": mu, "sigma": sigma}
+
+
+# ====================================
+# MONTE CARLO SIMULATION
+# ====================================
+def monte_carlo_paths(
+    last_price: float,
+    mu: float,
+    sigma: float,
+    days: int,
+    simulations: int,
+    seed: Optional[int] = None
+) -> np.ndarray:
+
+    if seed is not None:
+        np.random.seed(seed)
+
+    shocks = np.random.normal(mu, sigma, size=(days, simulations))
+    log_paths = np.log(last_price) + np.cumsum(shocks, axis=0)
+
+    return np.exp(log_paths)
+
+
+# ====================================
+# ROLLING PARAMETER SIMULATION
+# ====================================
+def rolling_monte_carlo(
+    prices: pd.Series,
+    test_prices: pd.Series,
+    window: int,
+    simulations: int
+) -> np.ndarray:
+    sims = []
+
+    for i in range(len(test_prices)):
+        hist = prices.iloc[-window + i : i] if i > 0 else prices.iloc[-window:]
+        params = estimate_return_params(hist)
+
+        day_sim = monte_carlo_paths(
+            last_price=hist.iloc[-1],
+            mu=params["mu"],
+            sigma=params["sigma"],
+            days=1,
+            simulations=simulations
+        )
+
+        sims.append(day_sim[0])
+
+    return np.array(sims)
+
+
+# ====================================
+# EVALUATION
+# ====================================
+def evaluate_risk_bands(
+    sims: np.ndarray,
+    actual_prices: pd.Series,
+    sigma: float,
+    low_pct: int = 5,
+    high_pct: int = 95
+) -> Dict[str, float]:
+
+    median = np.median(sims, axis=1)
+    low_band = np.percentile(sims, low_pct, axis=1)
+    high_band = np.percentile(sims, high_pct, axis=1)
+
+    aligned = actual_prices.iloc[:len(median)]
+
+    rmse = np.sqrt(mean_squared_error(aligned, median))
+
+    outside = ((aligned < low_band) | (aligned > high_band)).sum()
+    breach_rate = outside / len(aligned)
+
+    avg_band_width = np.mean(high_band - low_band)
+    annualized_vol = sigma * np.sqrt(252)
+    max_downside = np.min(aligned.values - low_band)
+
+    return {
+        "rmse": rmse,
+        "hit_rate": 1 - breach_rate,
+        "breach_rate": breach_rate,
+        "days_outside_band": int(outside),
+        "avg_band_width": avg_band_width,
+        "annualized_vol": annualized_vol,
+        "max_downside_breach": max_downside,
+        "total_days": len(aligned),
+        "low_pct": low_pct,
+        "high_pct": high_pct
+    }
+
+
+# ====================================
+# MAIN WORKFLOW
+# ====================================
+if __name__ == "__main__":
+
+    ticker = "MBB"
+    train_start = "2015-01-01"
+    train_end = "2020-01-01"
+    test_end = "2021-01-01"
+
+    simulations = 300
+    rolling = False        # 🔹 Toggle rolling re-estimation
+    rolling_window = 252   # ~1 trading year
+
+    # Load data
+    train_prices = load_price_data(ticker, train_start, train_end)
+    test_prices = load_price_data(ticker, train_end, test_end)
+
+    # Estimate base parameters
+    params = estimate_return_params(train_prices)
+
+    # Monte Carlo paths
+    if rolling:
+        sims = rolling_monte_carlo(
+            train_prices,
+            test_prices,
+            window=rolling_window,
+            simulations=simulations
+        )
+    else:
+        sims = monte_carlo_paths(
+            last_price=train_prices.iloc[-1],
+            mu=params["mu"],
+            sigma=params["sigma"],
+            days=len(test_prices),
+            simulations=simulations,
+            seed=42
+        )
+
+    # Evaluation
+    metrics = evaluate_risk_bands(
+        sims,
+        test_prices,
+        sigma=params["sigma"]
+    )
+
+    # ====================================
+    # VISUALIZATION
+    # ====================================
+    dates = test_prices.index
+    median = np.median(sims, axis=1)
+    low = np.percentile(sims, 5, axis=1)
+    high = np.percentile(sims, 95, axis=1)
+
+    # Volatility-based envelope
+    vol_band = params["sigma"] * np.sqrt(np.arange(1, len(dates) + 1))
+    vol_upper = train_prices.iloc[-1] * np.exp(vol_band)
+    vol_lower = train_prices.iloc[-1] * np.exp(-vol_band)
+
+    plt.figure(figsize=(12, 5))
+
+    plt.plot(dates, test_prices.values, label="Actual Price", linewidth=1.5)
+    plt.plot(dates, median, linestyle="--", label="Median MC Projection")
+
+    plt.fill_between(
+        dates,
+        low,
+        high,
+        alpha=0.25,
+        label="5–95% Price Risk Envelope"
+    )
+
+    plt.fill_between(
+        dates,
+        vol_lower,
+        vol_upper,
+        alpha=0.15,
+        label="Volatility Risk Envelope"
+    )
+
+    plt.title(
+        f"{ticker} — Monte Carlo Risk Framework\n"
+        f"Out-of-Sample Evaluation ({train_end} → {test_end})"
+    )
+
+    plt.xlabel("Date")
+    plt.ylabel("Price (USD)")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
